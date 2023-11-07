@@ -2,7 +2,7 @@ import appStoreMock from "../../../../../tests/libs/__mocks__/app-store";
 import i18nMock from "../../../../../tests/libs/__mocks__/libServerI18n";
 import prismock from "../../../../../tests/libs/__mocks__/prisma";
 
-import type { BookingReference, Attendee } from "@prisma/client";
+import type { BookingReference, Attendee, Booking } from "@prisma/client";
 import type { Prisma } from "@prisma/client";
 import type { WebhookTriggerEvents } from "@prisma/client";
 import type Stripe from "stripe";
@@ -23,8 +23,8 @@ import type { EventBusyDate } from "@calcom/types/Calendar";
 
 import { getMockPaymentService } from "./MockPaymentService";
 
-logger.setSettings({ minLevel: "silly" });
-const log = logger.getChildLogger({ prefix: ["[bookingScenario]"] });
+logger.settings.minLevel = 0;
+const log = logger.getSubLogger({ prefix: ["[bookingScenario]"] });
 
 type InputWebhook = {
   appId: string | null;
@@ -66,6 +66,7 @@ type InputUser = Omit<typeof TestData.users.example, "defaultScheduleId"> & {
   id: number;
   defaultScheduleId?: number | null;
   credentials?: InputCredential[];
+  organizationId?: number | null;
   selectedCalendars?: InputSelectedCalendar[];
   schedules: {
     // Allows giving id in the input directly so that it can be referenced somewhere else as well
@@ -102,7 +103,7 @@ export type InputEventType = {
   schedule?: InputUser["schedules"][number];
 } & Partial<Omit<Prisma.EventTypeCreateInput, "users" | "schedule">>;
 
-type InputBooking = {
+type WhiteListedBookingProps = {
   id?: number;
   uid?: string;
   userId?: number;
@@ -117,6 +118,8 @@ type InputBooking = {
     credentialId?: number | null;
   })[];
 };
+
+type InputBooking = Partial<Omit<Booking, keyof WhiteListedBookingProps>> & WhiteListedBookingProps;
 
 export const Timezones = {
   "+5:30": "Asia/Kolkata",
@@ -262,8 +265,21 @@ async function addBookingsToDb(
   })[]
 ) {
   log.silly("TestData: Creating Bookings", JSON.stringify(bookings));
+
+  function getDateObj(time: string | Date) {
+    return time instanceof Date ? time : new Date(time);
+  }
+
+  // Make sure that we store the date in Date object always. This is to ensure consistency which Prisma does but not prismock
+  log.silly("Handling Prismock bug-3");
+  const fixedBookings = bookings.map((booking) => {
+    const startTime = getDateObj(booking.startTime);
+    const endTime = getDateObj(booking.endTime);
+    return { ...booking, startTime, endTime };
+  });
+
   await prismock.booking.createMany({
-    data: bookings,
+    data: fixedBookings,
   });
   log.silly(
     "TestData: Bookings as in DB",
@@ -404,6 +420,7 @@ async function addUsers(users: InputUser[]) {
         },
       };
     }
+
     return newUser;
   });
   // eslint-disable-next-line @typescript-eslint/ban-ts-comment
@@ -442,6 +459,16 @@ export async function createBookingScenario(data: ScenarioData) {
   return {
     eventTypes,
   };
+}
+
+export async function createOrganization(orgData: { name: string; slug: string }) {
+  const org = await prismock.team.create({
+    data: {
+      name: orgData.name,
+      slug: orgData.slug,
+    },
+  });
+  return org;
 }
 
 // async function addPaymentsToDb(payments: Prisma.PaymentCreateInput[]) {
@@ -633,7 +660,7 @@ export const TestData = {
     example: {
       name: "Example",
       email: "example@example.com",
-      username: "example",
+      username: "example.username",
       defaultScheduleId: 1,
       timeZone: Timezones["+5:30"],
     },
@@ -720,6 +747,7 @@ export function getOrganizer({
 }) {
   return {
     ...TestData.users.example,
+    organizationId: null as null | number,
     name,
     email,
     id,
@@ -731,24 +759,33 @@ export function getOrganizer({
   };
 }
 
-export function getScenarioData({
-  organizer,
-  eventTypes,
-  usersApartFromOrganizer = [],
-  apps = [],
-  webhooks,
-  bookings,
-}: // hosts = [],
-{
-  organizer: ReturnType<typeof getOrganizer>;
-  eventTypes: ScenarioData["eventTypes"];
-  apps?: ScenarioData["apps"];
-  usersApartFromOrganizer?: ScenarioData["users"];
-  webhooks?: ScenarioData["webhooks"];
-  bookings?: ScenarioData["bookings"];
-  // hosts?: ScenarioData["hosts"];
-}) {
+export function getScenarioData(
+  {
+    organizer,
+    eventTypes,
+    usersApartFromOrganizer = [],
+    apps = [],
+    webhooks,
+    bookings,
+  }: // hosts = [],
+  {
+    organizer: ReturnType<typeof getOrganizer>;
+    eventTypes: ScenarioData["eventTypes"];
+    apps?: ScenarioData["apps"];
+    usersApartFromOrganizer?: ScenarioData["users"];
+    webhooks?: ScenarioData["webhooks"];
+    bookings?: ScenarioData["bookings"];
+    // hosts?: ScenarioData["hosts"];
+  },
+  org?: { id: number | null } | undefined | null
+) {
   const users = [organizer, ...usersApartFromOrganizer];
+  if (org) {
+    users.forEach((user) => {
+      user.organizationId = org.id;
+    });
+  }
+
   eventTypes.forEach((eventType) => {
     if (
       eventType.users?.filter((eventTypeUser) => {
@@ -895,6 +932,7 @@ export function mockCalendar(
               url: "https://UNUSED_URL",
             });
           },
+          // eslint-disable-next-line @typescript-eslint/no-explicit-any
           deleteEvent: async (...rest: any[]) => {
             log.silly("mockCalendar.deleteEvent", JSON.stringify({ rest }));
             // eslint-disable-next-line prefer-rest-params
@@ -1019,6 +1057,7 @@ export function mockVideoApp({
                   ...videoMeetingData,
                 });
               },
+              // eslint-disable-next-line @typescript-eslint/no-explicit-any
               deleteMeeting: async (...rest: any[]) => {
                 log.silly("MockVideoApiAdapter.deleteMeeting", JSON.stringify(rest));
                 deleteMeetingCalls.push({
@@ -1151,7 +1190,6 @@ export async function mockPaymentSuccessWebhookFromStripe({ externalId }: { exte
     await handleStripePaymentSuccess(getMockedStripePaymentEvent({ paymentIntentId: externalId }));
   } catch (e) {
     log.silly("mockPaymentSuccessWebhookFromStripe:catch", JSON.stringify(e));
-
     webhookResponse = e as HttpError;
   }
   return { webhookResponse };
@@ -1203,3 +1241,35 @@ export const enum BookingLocations {
   CalVideo = "integrations:daily",
   ZoomVideo = "integrations:zoom",
 }
+
+const getMockAppStatus = ({
+  slug,
+  failures,
+  success,
+}: {
+  slug: string;
+  failures: number;
+  success: number;
+}) => {
+  const foundEntry = Object.entries(appStoreMetadata).find(([, app]) => {
+    return app.slug === slug;
+  });
+  if (!foundEntry) {
+    throw new Error("App not found for the slug");
+  }
+  const foundApp = foundEntry[1];
+  return {
+    appName: foundApp.slug,
+    type: foundApp.type,
+    failures,
+    success,
+    errors: [],
+  };
+};
+export const getMockFailingAppStatus = ({ slug }: { slug: string }) => {
+  return getMockAppStatus({ slug, failures: 1, success: 0 });
+};
+
+export const getMockPassingAppStatus = ({ slug }: { slug: string }) => {
+  return getMockAppStatus({ slug, failures: 0, success: 1 });
+};
